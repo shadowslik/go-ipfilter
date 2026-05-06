@@ -1,7 +1,3 @@
-// Package ipfilter provides fast IP address matching against sets of exact IPs,
-// CIDR subnets, and IP ranges. It uses a Patricia compressed trie (radix tree)
-// for O(log n) CIDR lookups and an optional expirable LRU cache to avoid
-// repeated lookups for recently seen addresses.
 package ipfilter
 
 import (
@@ -16,11 +12,10 @@ import (
 	"github.com/yl2chen/cidranger"
 )
 
-// Entry kinds.
 const (
-	KindExact  = "exact"
-	KindCIDR   = "cidr"
-	KindRange  = "range"
+	KindExact = "exact"
+	KindCIDR  = "cidr"
+	KindRange = "range"
 )
 
 type ipRange struct {
@@ -29,11 +24,7 @@ type ipRange struct {
 	raw   string
 }
 
-// Matcher holds a set of IP entries and provides thread-safe fast lookup.
-// Supported entry formats:
-//   - Exact IPv4/IPv6 address: "192.168.1.1"
-//   - CIDR notation:           "10.0.0.0/8"
-//   - IP range:                "192.168.1.1-192.168.1.254"
+// Matcher - основная структура для проверки принадлежности IP к списку разрешённых/заблокированных адресов
 type Matcher struct {
 	mu       sync.RWMutex
 	exactIPs map[string]struct{}
@@ -43,8 +34,7 @@ type Matcher struct {
 	cache    *lruexpirable.LRU[string, bool]
 }
 
-// New creates a Matcher with an LRU cache of the given size and TTL.
-// Pass cacheSize=0 or cacheTTL=0 to disable caching.
+// New создаёт новый Matcher с кэшем указанного размера и TTL
 func New(cacheSize int, cacheTTL time.Duration) *Matcher {
 	m := &Matcher{
 		exactIPs: make(map[string]struct{}),
@@ -56,7 +46,7 @@ func New(cacheSize int, cacheTTL time.Duration) *Matcher {
 	return m
 }
 
-// Reset replaces all entries atomically.
+// Reset полностью заменяет список правил на новый slice entries
 func (m *Matcher) Reset(entries []string) error {
 	exactIPs := make(map[string]struct{})
 	ranger := cidranger.NewPCTrieRanger()
@@ -78,7 +68,7 @@ func (m *Matcher) Reset(entries []string) error {
 	return nil
 }
 
-// Add inserts a single entry. Returns an error if the format is invalid.
+// Add добавляет одно правило в список (точный IP, CIDR или диапазон)
 func (m *Matcher) Add(entry string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -90,7 +80,7 @@ func (m *Matcher) Add(entry string) error {
 	return nil
 }
 
-// Remove deletes an entry and rebuilds internal indexes.
+// Remove удаляет правило из списка и полностью перестраивает внутренние структуры
 func (m *Matcher) Remove(entry string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -103,7 +93,7 @@ func (m *Matcher) Remove(entry string) {
 	}
 	m.raw = filtered
 
-	// Rebuild indexes (cidranger has no Delete method).
+	// Перестраиваем всё заново
 	exactIPs := make(map[string]struct{})
 	ranger := cidranger.NewPCTrieRanger()
 	var ranges []ipRange
@@ -116,7 +106,7 @@ func (m *Matcher) Remove(entry string) {
 	m.invalidateCache()
 }
 
-// Match reports whether ip is covered by any entry in the set.
+// Match проверяет, принадлежит ли IP-адрес (в виде строки) одному из правил
 func (m *Matcher) Match(ipStr string) (bool, error) {
 	if m.cache != nil {
 		if v, ok := m.cache.Get(ipStr); ok {
@@ -139,16 +129,14 @@ func (m *Matcher) Match(ipStr string) (bool, error) {
 	return result, nil
 }
 
+// matchLocked внутренний метод для проверки IP без блокировок (требует RLock снаружи)
 func (m *Matcher) matchLocked(ip net.IP, ipStr string) bool {
-	// 1. Exact match — O(1)
 	if _, ok := m.exactIPs[ip.String()]; ok {
 		return true
 	}
-	// 2. CIDR via Patricia trie — O(log n)
 	if entries, err := m.ranger.ContainingNetworks(ip); err == nil && len(entries) > 0 {
 		return true
 	}
-	// 3. IP ranges — linear but typically very few
 	for _, r := range m.ranges {
 		if bytes.Compare(ip, r.start) >= 0 && bytes.Compare(ip, r.end) <= 0 {
 			return true
@@ -157,7 +145,7 @@ func (m *Matcher) matchLocked(ip net.IP, ipStr string) bool {
 	return false
 }
 
-// Entries returns a copy of all raw entries.
+// Entries возвращает копию исходного списка всех добавленных правил
 func (m *Matcher) Entries() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -166,20 +154,21 @@ func (m *Matcher) Entries() []string {
 	return out
 }
 
-// InvalidateCache clears the LRU cache (e.g. after bulk reload).
+// InvalidateCache очищает весь кэш результатов проверки
 func (m *Matcher) InvalidateCache() {
 	m.mu.Lock()
 	m.invalidateCache()
 	m.mu.Unlock()
 }
 
+// invalidateCache внутренний метод очистки кэша без блокировок
 func (m *Matcher) invalidateCache() {
 	if m.cache != nil {
 		m.cache.Purge()
 	}
 }
 
-// addEntry parses one entry string and populates the appropriate index.
+// addEntry парсит строку правила и добавляет её в соответствующие внутренние структуры
 func addEntry(entry string, exactIPs map[string]struct{}, ranger cidranger.Ranger, ranges *[]ipRange) error {
 	entry = strings.TrimSpace(entry)
 	switch {

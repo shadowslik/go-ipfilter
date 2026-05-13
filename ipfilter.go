@@ -24,7 +24,12 @@ type ipRange struct {
 	raw   string
 }
 
-// Matcher - основная структура для проверки принадлежности IP к списку разрешённых/заблокированных адресов
+type Stats struct {
+	ExactCount int
+	RangeCount int
+	CacheSize  int
+}
+
 type Matcher struct {
 	mu       sync.RWMutex
 	exactIPs map[string]struct{}
@@ -34,7 +39,6 @@ type Matcher struct {
 	cache    *lruexpirable.LRU[string, bool]
 }
 
-// New создаёт новый Matcher с кэшем указанного размера и TTL
 func New(cacheSize int, cacheTTL time.Duration) *Matcher {
 	m := &Matcher{
 		exactIPs: make(map[string]struct{}),
@@ -46,7 +50,6 @@ func New(cacheSize int, cacheTTL time.Duration) *Matcher {
 	return m
 }
 
-// Reset полностью заменяет список правил на новый slice entries
 func (m *Matcher) Reset(entries []string) error {
 	exactIPs := make(map[string]struct{})
 	ranger := cidranger.NewPCTrieRanger()
@@ -68,7 +71,6 @@ func (m *Matcher) Reset(entries []string) error {
 	return nil
 }
 
-// Add добавляет одно правило в список (точный IP, CIDR или диапазон)
 func (m *Matcher) Add(entry string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -80,20 +82,24 @@ func (m *Matcher) Add(entry string) error {
 	return nil
 }
 
-// Remove удаляет правило из списка и полностью перестраивает внутренние структуры
-func (m *Matcher) Remove(entry string) {
+func (m *Matcher) Remove(entry string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	found := false
 	filtered := m.raw[:0]
 	for _, s := range m.raw {
-		if s != entry {
+		if s == entry {
+			found = true
+		} else {
 			filtered = append(filtered, s)
 		}
 	}
+	if !found {
+		return false
+	}
 	m.raw = filtered
 
-	// Перестраиваем всё заново
 	exactIPs := make(map[string]struct{})
 	ranger := cidranger.NewPCTrieRanger()
 	var ranges []ipRange
@@ -104,9 +110,9 @@ func (m *Matcher) Remove(entry string) {
 	m.ranger = ranger
 	m.ranges = ranges
 	m.invalidateCache()
+	return true
 }
 
-// Match проверяет, принадлежит ли IP-адрес (в виде строки) одному из правил
 func (m *Matcher) Match(ipStr string) (bool, error) {
 	if m.cache != nil {
 		if v, ok := m.cache.Get(ipStr); ok {
@@ -120,7 +126,7 @@ func (m *Matcher) Match(ipStr string) (bool, error) {
 	}
 
 	m.mu.RLock()
-	result := m.matchLocked(ip, ipStr)
+	result := m.matchLocked(ip)
 	m.mu.RUnlock()
 
 	if m.cache != nil {
@@ -129,23 +135,25 @@ func (m *Matcher) Match(ipStr string) (bool, error) {
 	return result, nil
 }
 
-// matchLocked внутренний метод для проверки IP без блокировок (требует RLock снаружи)
-func (m *Matcher) matchLocked(ip net.IP, ipStr string) bool {
+func (m *Matcher) matchLocked(ip net.IP) bool {
 	if _, ok := m.exactIPs[ip.String()]; ok {
 		return true
 	}
 	if entries, err := m.ranger.ContainingNetworks(ip); err == nil && len(entries) > 0 {
 		return true
 	}
+	cmp := ip
+	if v4 := ip.To4(); v4 != nil {
+		cmp = v4
+	}
 	for _, r := range m.ranges {
-		if bytes.Compare(ip, r.start) >= 0 && bytes.Compare(ip, r.end) <= 0 {
+		if bytes.Compare(cmp, r.start) >= 0 && bytes.Compare(cmp, r.end) <= 0 {
 			return true
 		}
 	}
 	return false
 }
 
-// Entries возвращает копию исходного списка всех добавленных правил
 func (m *Matcher) Entries() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -154,21 +162,37 @@ func (m *Matcher) Entries() []string {
 	return out
 }
 
-// InvalidateCache очищает весь кэш результатов проверки
+func (m *Matcher) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.raw)
+}
+
+func (m *Matcher) Stats() Stats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s := Stats{
+		ExactCount: len(m.exactIPs),
+		RangeCount: len(m.ranges),
+	}
+	if m.cache != nil {
+		s.CacheSize = m.cache.Len()
+	}
+	return s
+}
+
 func (m *Matcher) InvalidateCache() {
 	m.mu.Lock()
 	m.invalidateCache()
 	m.mu.Unlock()
 }
 
-// invalidateCache внутренний метод очистки кэша без блокировок
 func (m *Matcher) invalidateCache() {
 	if m.cache != nil {
 		m.cache.Purge()
 	}
 }
 
-// addEntry парсит строку правила и добавляет её в соответствующие внутренние структуры
 func addEntry(entry string, exactIPs map[string]struct{}, ranger cidranger.Ranger, ranges *[]ipRange) error {
 	entry = strings.TrimSpace(entry)
 	switch {
@@ -188,6 +212,15 @@ func addEntry(entry string, exactIPs map[string]struct{}, ranger cidranger.Range
 		end := net.ParseIP(strings.TrimSpace(parts[1]))
 		if start == nil || end == nil {
 			return fmt.Errorf("ipfilter: invalid range %q", entry)
+		}
+		if v4 := start.To4(); v4 != nil {
+			start = v4
+		}
+		if v4 := end.To4(); v4 != nil {
+			end = v4
+		}
+		if bytes.Compare(start, end) > 0 {
+			return fmt.Errorf("ipfilter: invalid range %q: start must be <= end", entry)
 		}
 		*ranges = append(*ranges, ipRange{start: start, end: end, raw: entry})
 
